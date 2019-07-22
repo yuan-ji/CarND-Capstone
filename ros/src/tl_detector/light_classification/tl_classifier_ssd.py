@@ -5,7 +5,6 @@ import cv2
 import tensorflow as tf
 from keras.models import load_model
 from styx_msgs.msg import TrafficLightArray, TrafficLight
-import os
 
 
 # Uncomment the following code if need to visualize the detection output
@@ -20,31 +19,27 @@ def plot_one_box(img, coord, label=None, score=None, color=None, line_thickness=
     color: int. color index.
     line_thickness: int. rectangle line thickness.
     '''
-    tl = line_thickness or int(
-        round(0.002 * max(img.shape[0:2])))  # line thickness
-    color = color or [255, 0, 0]
+    tl = line_thickness or int(round(0.002 * max(img.shape[0:2])))  # line thickness
+    color = color or [255,0,0]
     c1, c2 = (int(coord[0]), int(coord[1])), (int(coord[2]), int(coord[3]))
     cv2.rectangle(img, c1, c2, color, thickness=tl)
     if label:
-        label = '%s:%.2f' % (label, score)
+        label = '%s:%.2f'%(label,score)
         tf = max(tl - 1, 1)  # font thickness
-        t_size = cv2.getTextSize(
-            label, 0, fontScale=float(tl) / 5, thickness=tf)[0]
+        t_size = cv2.getTextSize(label, 0, fontScale=float(tl) / 5, thickness=tf)[0]
         c2 = c1[0] + t_size[0], c1[1] - t_size[1] - 3
         cv2.rectangle(img, c1, c2, color, -1)  # filled
-        cv2.putText(img, label, (c1[0], c1[1] - 2),
-                    0, float(tl) / 5, [0, 0, 0], thickness=tf)
-
+        cv2.putText(img, label, (c1[0], c1[1] - 2), 0, float(tl) / 5, [0, 0, 0], thickness=tf)
 
 class TLClassifier_SSD(object):
     def __init__(self, DEBUG_OUTPUT=False):
         self.DEBUG_SWITCH = DEBUG_OUTPUT
-        self.is_carla = True
-        # self.is_carla=True
-        # self.threshold = rospy.get_param("~threshold")
-        # self.hw_ratio = rospy.get_param("~hw_ratio")
-        self.threshold = 0.01
-        self.hw_ratio = 0.5  # height_width ratio
+        self.is_carla=rospy.get_param("is_carla")
+        #self.is_carla=True
+        self.threshold =rospy.get_param("~threshold")
+        #self.threshold = 0.01
+        self.hw_ratio = rospy.get_param("~hw_ratio")
+        #self.hw_ratio = 0.5  # height_width ratio
         print('Initializing classifier with threshold =', self.threshold)
         self.signal_classes = ['Red', 'Green', 'Yellow']
         self.light_state = TrafficLight.UNKNOWN
@@ -52,20 +47,31 @@ class TLClassifier_SSD(object):
         if self.DEBUG_SWITCH:
             self.DEBUG_IMAGE = None
 
-        # os.chdir(cwd+'/models')
+        # if sim_testing, we use a detection and classification models
+        # if site_testing, we use a single model which does both detection and classification
+        model_path_base='models/ssd/'
+        if not self.is_carla:  # we use different models for classification
+            # keras classification model
+            self.cls_model = load_model(model_path_base+'tl_model_5.h5')  # switched to model 5 for harsh light
+            self.graph = tf.get_default_graph()
+            # tensorflow localization/detection model
+            PATH_TO_CKPT = 'frozen_inference_graph_ssd_mobilenet_v1_coco_11_06_2017.pb'
+            # setup tensorflow graph
+            self.detection_graph = tf.Graph()
+            # configuration for possible GPU
+            config = tf.ConfigProto()
+            config.gpu_options.allow_growth = True
 
-        model_path_base = 'light_classification/models/ssd/'
+        else:  # site testing where we load the localization+classification model
+            PATH_TO_CKPT = 'frozen_inference_graph_ssd_kyle_v4.pb'
+            # setup tensorflow graph
+            self.detection_graph = tf.Graph()
 
-        PATH_TO_CKPT = 'frozen_inference_graph_ssd_kyle_v4.pb'
-        rospy.loginfo("pwd is {}".format(os.getcwd()))
-        # setup tensorflow graph
-        self.detection_graph = tf.Graph()
-
-        # configuration for possible GPU use
-        config = tf.ConfigProto()
-        config.gpu_options.allow_growth = True
-        # load frozen tensorflow detection model and initialize
-        # the tensorflow graph
+            # configuration for possible GPU use
+            config = tf.ConfigProto()
+            config.gpu_options.allow_growth = True
+            # load frozen tensorflow detection model and initialize
+            # the tensorflow graph
 
         with self.detection_graph.as_default():
             od_graph_def = tf.GraphDef()
@@ -75,26 +81,22 @@ class TLClassifier_SSD(object):
                 tf.import_graph_def(od_graph_def, name='')
 
             self.sess = tf.Session(graph=self.detection_graph, config=config)
-            self.image_tensor = self.detection_graph.get_tensor_by_name(
-                'image_tensor:0')
+            self.image_tensor = self.detection_graph.get_tensor_by_name('image_tensor:0')
             # Each box represents a part of the image where a particular object was detected.
-            self.boxes = self.detection_graph.get_tensor_by_name(
-                'detection_boxes:0')
+            self.boxes = self.detection_graph.get_tensor_by_name('detection_boxes:0')
             # Each score represent how level of confidence for each of the objects.
             # Score is shown on the result image, together with the class label.
-            self.scores = self.detection_graph.get_tensor_by_name(
-                'detection_scores:0')
-            self.classes = self.detection_graph.get_tensor_by_name(
-                'detection_classes:0')
-            self.num_detections = self.detection_graph.get_tensor_by_name(
-                'num_detections:0')
+            self.scores = self.detection_graph.get_tensor_by_name('detection_scores:0')
+            self.classes = self.detection_graph.get_tensor_by_name('detection_classes:0')
+            self.num_detections = self.detection_graph.get_tensor_by_name('num_detections:0')
+
+
 
     # Helper function to convert normalized box coordinates to pixels
     def box_normal_to_pixel(self, box, dim):
 
         height, width = dim[0], dim[1]
-        box_pixel = [int(box[0] * height), int(box[1] * width),
-                     int(box[2] * height), int(box[3] * width)]
+        box_pixel = [int(box[0] * height), int(box[1] * width), int(box[2] * height), int(box[3] * width)]
         return np.array(box_pixel)
 
     def get_simulator_localization(self, image):
@@ -118,6 +120,7 @@ class TLClassifier_SSD(object):
             classes = np.squeeze(classes)
             scores = np.squeeze(scores)
 
+            
             if self.DEBUG_SWITCH:
                 height_ori, width_ori = image.shape[:2]
                 for i in range(len(boxes)):
@@ -142,8 +145,7 @@ class TLClassifier_SSD(object):
                 box = [0, 0, 0, 0]
                 print('no detection!')
             # If the confidence of detection is too slow, 0.3 for simulator
-            # updated site treshold to 0.01 for harsh light
-            elif scores[idx] <= self.threshold:
+            elif scores[idx] <= self.threshold:  # updated site treshold to 0.01 for harsh light
                 box = [0, 0, 0, 0]
                 print('low confidence:', scores[idx])
             # If there is a detection and its confidence is high enough
@@ -165,8 +167,7 @@ class TLClassifier_SSD(object):
                 else:
                     print(box)
                     print('localization confidence: ', scores[idx])
-                    rospy.logdebug(
-                        'localization confidence:==============================='+str(scores[idx]))
+                    rospy.logdebug('localization confidence:==============================='+str(scores[idx]))
             # ****************end of corner cases***********************
 
         return box
@@ -199,7 +200,7 @@ class TLClassifier_SSD(object):
         elif tl_color == 'Green':
             signal_status = TrafficLight.GREEN
         elif tl_color == 'Yellow':
-            signal_status = TrafficLight.YELLOW
+            signal_status =  TrafficLight.YELLOW
 
         return signal_status
 
@@ -228,6 +229,7 @@ class TLClassifier_SSD(object):
             classes = np.squeeze(classes)  # classes
             scores = np.squeeze(scores)  # confidence
 
+            
             if self.DEBUG_SWITCH:
                 height_ori, width_ori = image.shape[:2]
                 for i in range(len(boxes)):
@@ -286,8 +288,7 @@ class TLClassifier_SSD(object):
                 else:
                     print(box)
                     print('localization confidence: ', scores[idx])
-                    rospy.logdebug(
-                        'localization confidence:==============================='+str(scores[idx]))
+                    rospy.logdebug('localization confidence:==============================='+str(scores[idx]))
             # ****************end of corner cases***********************
 
         return box, conf, cls_idx
@@ -303,34 +304,33 @@ class TLClassifier_SSD(object):
 
         """
         light_state = TrafficLight.UNKNOWN
-        # TODO implement light color prediction
+        #TODO implement light color prediction
         if self.is_carla:
-            processed_img = cv_image[0:600, 0:800]  # was [20:400, 0:800]
-            processed_img = cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB)
-            img_full_np = np.asarray(processed_img, dtype="uint8")
-            b, conf, cls_idx = self.get_carla_localization_classification(
-                img_full_np)
-            print("Get out of Localization-Classification")
-            if np.array_equal(b, np.zeros(4)):
-                print('unknown')
-                light_state = TrafficLight.UNKNOWN
-            else:
-                # light_state = cls_idx
-                if cls_idx == 1.0:
-                    print('Green', b)
-                    light_state = TrafficLight.GREEN
-                elif cls_idx == 2.0:
-                    print('Red', b)
-                    light_state = TrafficLight.RED
-                elif cls_idx == 3.0:
-                    print('Yellow', b)
-                    light_state = TrafficLight.YELLOW
-                elif cls_idx == 4.0:
-                    print('Unknown', b)
-                    light_state = TrafficLight.UNKNOWN
-                else:
-                    print('Really Unknown! Didn\'t process image well', b)
-                    light_state = TrafficLight.UNKNOWN
+           processed_img = cv_image[0:600, 0:800]  # was [20:400, 0:800]
+           processed_img = cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB)
+           img_full_np=np.asarray(processed_img, dtype="uint8")
+           b, conf, cls_idx = self.get_carla_localization_classification(img_full_np)
+           print("Get out of Localization-Classification")
+           if np.array_equal(b, np.zeros(4)):
+               print('unknown')
+               light_state = TrafficLight.UNKNOWN
+           else:
+               # light_state = cls_idx
+               if cls_idx == 1.0:
+                   print('Green', b)
+                   light_state = TrafficLight.GREEN
+               elif cls_idx == 2.0:
+                   print('Red', b)
+                   light_state = TrafficLight.RED
+               elif cls_idx == 3.0:
+                   print('Yellow', b)
+                   light_state = TrafficLight.YELLOW
+               elif cls_idx == 4.0:
+                   print('Unknown', b)
+                   light_state = TrafficLight.UNKNOWN
+               else:
+                   print('Really Unknown! Didn\'t process image well', b)
+                   light_state = TrafficLight.UNKNOWN
         else:
             width, height, _ = cv_image.shape
             x_start = int(width * 0.10)
@@ -347,11 +347,9 @@ class TLClassifier_SSD(object):
                 print('unknown')
                 light_state = TrafficLight.UNKNOWN
             else:  # we can use the classifier to classify the state of the traffic light
-                img_np = cv2.resize(
-                    processed_img[b[0]:b[2], b[1]:b[3]], (32, 32))
-                light_state = self.get_simulator_classification(img_np)
-        rospy.logdebug(
-            'light_state==============================='+str(light_state))
+                img_np = cv2.resize(processed_img[b[0]:b[2], b[1]:b[3]], (32, 32))
+                light_state=self.get_simulator_classification(img_np)
+        rospy.logdebug('light_state==============================='+str(light_state))
 
         self.light_state = light_state
         if light_state == TrafficLight.UNKNOWN:
@@ -362,9 +360,8 @@ class TLClassifier_SSD(object):
     def get_classification(self):
         return self.light_state
 
-
 if __name__ == '__main__':
-    tl_cls = TLClassifier()
+    tl_cls=TLClassifier()
     img_path = ''
     cv_image = cv2.imread(img_path)
     cv_image = cv2.resize(cv_image, (800, 600))
