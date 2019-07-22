@@ -1,119 +1,246 @@
-from styx_msgs.msg import TrafficLight
+import rospy
+
 import numpy as np
-#import matplotlib.pyplot as plt
-from PIL import Image
-from PIL import ImageDraw
-from PIL import ImageColor
-from sensor_msgs.msg import Image as ImageMsg
-import time
-from scipy.stats import norm
 import cv2
 import tensorflow as tf
-import rospy
-from cv_bridge import CvBridge, CvBridgeError
+from keras.models import load_model
+from styx_msgs.msg import TrafficLightArray, TrafficLight
 
-GRAPH_FILE="ssd_mobilenet_v1_coco_11_06_2017/frozen_inference_graph.pb"
+
+# Uncomment the following code if need to visualize the detection output
+# os.chdir(cwd+'/models')
+# from object_detection.utils import visualization_utils as vis_util
+
+def plot_one_box(img, coord, label=None, score=None, color=None, line_thickness=None):
+    '''
+    coord: [x_min, y_min, x_max, y_max] format coordinates.
+    img: img to plot on.
+    label: str. The label name.
+    color: int. color index.
+    line_thickness: int. rectangle line thickness.
+    '''
+    tl = line_thickness or int(round(0.002 * max(img.shape[0:2])))  # line thickness
+    color = color or [255,0,0]
+    c1, c2 = (int(coord[0]), int(coord[1])), (int(coord[2]), int(coord[3]))
+    cv2.rectangle(img, c1, c2, color, thickness=tl)
+    if label:
+        label = '%s:%.2f'%(label,score)
+        tf = max(tl - 1, 1)  # font thickness
+        t_size = cv2.getTextSize(label, 0, fontScale=float(tl) / 5, thickness=tf)[0]
+        c2 = c1[0] + t_size[0], c1[1] - t_size[1] - 3
+        cv2.rectangle(img, c1, c2, color, -1)  # filled
+        cv2.putText(img, label, (c1[0], c1[1] - 2), 0, float(tl) / 5, [0, 0, 0], thickness=tf)
 
 class TLClassifier(object):
     def __init__(self):
-        rospy.init_node('tl_classifier', log_level=rospy.DEBUG)
+        self.threshold = 0.01
+        self.hw_ratio = 0.5  # height_width ratio
+        print('Initializing classifier with threshold =', self.threshold)
+        self.signal_classes = ['Red', 'Green', 'Yellow']
+        self.light_state = TrafficLight.UNKNOWN
 
-        self.traffic_light_list = []
-        self.traffic_light_scores = []
-        self.graph_file = GRAPH_FILE
-        
-        cmap = ImageColor.colormap
-        #print("Number of colors =", len(cmap))
-        self.COLOR_LIST = sorted([c for c in cmap.keys()])
+        # if sim_testing, we use a detection and classification models
+        # if site_testing, we use a single model which does both detection and classification
+        model_path_base='models/ssd/'
 
-        #TODO load classifier
+        PATH_TO_CKPT = 'frozen_inference_graph_ssd_kyle_v4.pb'
+        # setup tensorflow graph
         self.detection_graph = tf.Graph()
+
+        # configuration for possible GPU use
+        config = tf.ConfigProto()
+        config.gpu_options.allow_growth = True
+        # load frozen tensorflow detection model and initialize
+        # the tensorflow graph
+
         with self.detection_graph.as_default():
             od_graph_def = tf.GraphDef()
-            with tf.gfile.GFile(self.graph_file, 'rb') as fid:
+            with tf.gfile.GFile(model_path_base+PATH_TO_CKPT, 'rb') as fid:
                 serialized_graph = fid.read()
                 od_graph_def.ParseFromString(serialized_graph)
                 tf.import_graph_def(od_graph_def, name='')
-                
-        self.image_tensor = self.detection_graph.get_tensor_by_name('image_tensor:0')
-        self.detection_boxes = self.detection_graph.get_tensor_by_name('detection_boxes:0')
-        self.detection_scores = self.detection_graph.get_tensor_by_name('detection_scores:0')
-        self.detection_classes = self.detection_graph.get_tensor_by_name('detection_classes:0')
 
-        self.frame_count = 0
+            self.sess = tf.Session(graph=self.detection_graph, config=config)
+            self.image_tensor = self.detection_graph.get_tensor_by_name('image_tensor:0')
+            # Each box represents a part of the image where a particular object was detected.
+            self.boxes = self.detection_graph.get_tensor_by_name('detection_boxes:0')
+            # Each score represent how level of confidence for each of the objects.
+            # Score is shown on the result image, together with the class label.
+            self.scores = self.detection_graph.get_tensor_by_name('detection_scores:0')
+            self.classes = self.detection_graph.get_tensor_by_name('detection_classes:0')
+            self.num_detections = self.detection_graph.get_tensor_by_name('num_detections:0')
 
-    
-    def detect_traffic_lights(self, img, confidence_level=0.2, detect_class_id=[10]):
-        #rospy.loginfo("Detection start: %s", time.time())
-        image = Image.fromarray(cv2.cvtColor(img,cv2.COLOR_BGR2RGB))  
-        image_np = np.expand_dims(np.asarray(image, dtype=np.uint8), 0)
-        width, height = image.size
-        rospy.logdebug("detect_traffic_lights, img.shape=%s", img.shape)
+    # Helper function to convert normalized box coordinates to pixels
+    def box_normal_to_pixel(self, box, dim):
 
-        with tf.Session(graph=self.detection_graph) as sess:                
-            # Actual detection.
-            (boxes, scores, classes) = sess.run([self.detection_boxes, 
-                                                    self.detection_scores, 
-                                                    self.detection_classes], 
-                                                feed_dict={self.image_tensor: image_np})
+        height, width = dim[0], dim[1]
+        box_pixel = [int(box[0] * height), int(box[1] * width), int(box[2] * height), int(box[3] * width)]
+        return np.array(box_pixel)
 
-        # Remove unnecessary dimensions
-        boxes = np.squeeze(boxes)
-        scores = np.squeeze(scores)
-        classes = np.squeeze(classes)
+    def get_simulator_localization(self, image):
+        """Determines the locations of the traffic light in the image
 
-        # Filter boxes with a confidence score less than `confidence_cutoff`
-        boxes, scores, classes = self.filter_boxes(confidence_level, boxes, scores, classes, detect_class_id)
-        #rospy.logdebug("scores.shape=%s, classes.shape=%s, boxes.shape=%s", scores.shape, classes.shape, boxes.shape)
-        #rospy.logdebug("scores=%s, classes=%s", scores, classes)
-        #rospy.logdebug(" boxes=%s", boxes)
+        Args:
+            image: camera image
 
-        box_coords = self.to_image_coords(boxes, height, width)
-        #rospy.logdebug(" box_coords.shape=%s, box_coords=%s", box_coords.shape, box_coords)
-        #rospy.logdebug(" box_coords=%s", box_coords)
-        self.traffic_light_list = []
-        for box in box_coords:
-            top,left,bottom,right = box
-            traffic_light = image.crop((left,top,
-                                        right, bottom ) )
-            traffic_light = traffic_light.copy()
-            traffic_light = traffic_light.resize((32, 32))
-            
-            self.traffic_light_list.append(traffic_light)
-            
-        self.traffic_light_scores = scores
-
-        #Debug code start
-        '''
-        self.draw_boxes(image, box_coords, classes)
-        cv2_output_img = cv2.cvtColor(np.asarray(image),cv2.COLOR_RGB2BGR)  
+        Returns:
+            list of integers: coordinates [x_left, y_up, x_right, y_down]
 
         """
-        try:
-            image_message = self.bridge.cv2_to_imgmsg(cv2_output_img, encoding="bgr8")
-        except CvBridgeError as e:
-            print(e)
-        self.detection_traffic_light_pub.publish(image_message)
+
+        with self.detection_graph.as_default():
+            image_expanded = np.expand_dims(image, axis=0)
+            (boxes, scores, classes, num_detections) = self.sess.run(
+                [self.boxes, self.scores, self.classes, self.num_detections],
+                feed_dict={self.image_tensor: image_expanded})
+
+            boxes = np.squeeze(boxes)
+            classes = np.squeeze(classes)
+            scores = np.squeeze(scores)
+
+
+            cls = classes.tolist()
+            # print(cls)
+            # Find the first occurence of traffic light detection id=10
+            idx = next((i for i, v in enumerate(cls) if v == 10.), None)
+            # If there is no detection
+            if idx == None:
+                box = [0, 0, 0, 0]
+                print('no detection!')
+            # If the confidence of detection is too slow, 0.3 for simulator
+            elif scores[idx] <= self.threshold:  # updated site treshold to 0.01 for harsh light
+                box = [0, 0, 0, 0]
+                print('low confidence:', scores[idx])
+            # If there is a detection and its confidence is high enough
+            else:
+                # *************corner cases***********************************
+                dim = image.shape[0:2]
+                box = self.box_normal_to_pixel(boxes[idx], dim)
+                box_h = box[2] - box[0]
+                box_w = box[3] - box[1]
+                ratio = box_h / (box_w + 0.01)
+                # if the box is too small, 20 pixels for simulator
+                if (box_h < 20) or (box_w < 20):
+                    box = [0, 0, 0, 0]
+                    print('box too small!', box_h, box_w)
+                # if the h-w ratio is not right, 1.5 for simulator, 0.5 for site
+                elif (ratio < self.hw_ratio):
+                    box = [0, 0, 0, 0]
+                    print('wrong h-w ratio', ratio)
+                else:
+                    print(box)
+                    print('localization confidence: ', scores[idx])
+                    rospy.logdebug('localization confidence:==============================='+str(scores[idx]))
+            # ****************end of corner cases***********************
+
+        return box
+
+    def get_simulator_classification(self, image):
+        """Determines the color of the traffic light in the image
+
+        Args:
+            image (cv::Mat): cropped image containing the traffic light
+
+        Returns:
+            int: ID of traffic light color (specified in styx_msgs/TrafficLight)
+
         """
-        cv2.imshow("Image window", cv2_output_img)
-        cv2.waitKey(3)
-        '''
-        #Debug code end
+        signal_status = TrafficLight.UNKNOWN
+        img_resize = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        # Convert to four-dimension input as required by Keras
+        img_resize = np.expand_dims(img_resize, axis=0).astype('float32')
+        # Normalization
+        img_resize /= 255.
+        # Prediction
+        with self.graph.as_default():
+            predict = self.cls_model.predict(img_resize)
+            # Get color classification
+            tl_color = self.signal_classes[np.argmax(predict)]
+            # TrafficLight message
+        # uncomment the following in real test
+        if tl_color == 'Red':
+            signal_status = TrafficLight.RED
+        elif tl_color == 'Green':
+            signal_status = TrafficLight.GREEN
+        elif tl_color == 'Yellow':
+            signal_status =  TrafficLight.YELLOW
 
+        return signal_status
 
-        #pic_filename = "./result/%08d.png"%self.frame_count
-        #image.save(pic_filename)
-        self.frame_count += 1
-        
-        if len(scores) < 1:
-            rospy.logdebug("No traffic light!")
-        else:
-            #rospy.logdebug("%d Traffic light(s) detected!, .shape=%s",len(scores), scores.shape)
-            rospy.logdebug("%d traffic_light_scores=%s", len(scores), scores)
+    # Main function for end-to-end bounding box localization and light color
+    # classification
+    def get_carla_localization_classification(self, image):
+        """Determines the locations of the traffic light in the image
 
-        return len(scores)
-        
-    def get_classification(self):
+        Args:
+            image: camera image
+
+        Returns:
+            box: list of integer for coordinates [x_left, y_up, x_right, y_down]
+            conf: confidence
+            cls_idx: 1->Green, 2->Red, 3->Yellow
+
+        """
+
+        with self.detection_graph.as_default():
+            image_expanded = np.expand_dims(image, axis=0)
+            (boxes, scores, classes, num_detections) = self.sess.run(
+                [self.boxes, self.scores, self.classes, self.num_detections],
+                feed_dict={self.image_tensor: image_expanded})
+
+            boxes = np.squeeze(boxes)  # bounding boxes
+            classes = np.squeeze(classes)  # classes
+            scores = np.squeeze(scores)  # confidence
+
+            cls = classes.tolist()
+
+            # Find the most confident detection/classification
+            idx = 0
+            conf = scores[idx]
+            cls_idx = cls[idx]
+
+            # If there is no detection
+            if idx == None:
+                box = [0, 0, 0, 0]
+                print('no detection!')
+                cls_idx = 4.0
+            # If the confidence of detection is too slow, 0.3 for simulator
+
+            # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+            elif scores[idx] <= 0.15:
+                # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+                box = [0, 0, 0, 0]
+                print('low confidence:', scores[idx])
+                cls_idx = 4.0
+            # If there is a detection and its confidence is high enough
+            else:
+                # *************corner cases***********************************
+                dim = image.shape[0:2]
+                box = self.box_normal_to_pixel(boxes[idx], dim)
+                box_h = box[2] - box[0]
+                box_w = box[3] - box[1]
+                ratio = box_h / (box_w + 0.01)
+                # if the box is too small, 20 pixels for simulator
+                if (box_h < 10) or (box_w < 10):
+                    box = [0, 0, 0, 0]
+                    cls_idx = 4.0
+                    print('box too small!', box_h, box_w)
+                # if the h-w ratio is not right, 1.5 for simulator
+                # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+                elif (ratio < 1.0):
+                    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+                    box = [0, 0, 0, 0]
+                    cls_idx = 4.0
+                    print('wrong h-w ratio', ratio)
+                else:
+                    print(box)
+                    print('localization confidence: ', scores[idx])
+                    rospy.logdebug('localization confidence:==============================='+str(scores[idx]))
+            # ****************end of corner cases***********************
+
+        return box, conf, cls_idx
+
+    def detect_traffic_lights(self, cv_image):
         """Determines the color of the traffic light in the image
 
         Args:
@@ -123,154 +250,48 @@ class TLClassifier(object):
             int: ID of traffic light color (specified in styx_msgs/TrafficLight)
 
         """
+        light_state = TrafficLight.UNKNOWN
         #TODO implement light color prediction
-        
-        #return TrafficLight.UNKNOWN
-        color_scores = [0.0, 0.0, 0.0]
-        for i in range(min(3,len(self.traffic_light_scores))):
-            result = self.red_green_yellow(self.traffic_light_list[i])
-            rospy.logdebug("Top prob #%d: %.4f %s", i, self.traffic_light_scores[i], result)
-            color_scores[result] += self.traffic_light_scores[i]
 
-        rospy.logdebug("color_scores.len=%s, color_scores=%s", len(color_scores), color_scores)
-        
-        if color_scores[0] > 2 * (color_scores[1] + color_scores[2]):
-            return TrafficLight.RED
-        elif color_scores[1] > 2 * (color_scores[0] + color_scores[2]):
-            return TrafficLight.YELLOW
-        elif color_scores[2] > 2 * (color_scores[0] + color_scores[1]):
-            return TrafficLight.GREEN
-        
-        return TrafficLight.UNKNOWN
-        
+        processed_img = cv_image[0:600, 0:800]  # was [20:400, 0:800]
+        processed_img = cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB)
+        img_full_np=np.asarray(processed_img, dtype="uint8")
+        b, conf, cls_idx = self.get_carla_localization_classification(img_full_np)
+        if np.array_equal(b, np.zeros(4)):
+            light_state = TrafficLight.UNKNOWN
+        else:
+            # light_state = cls_idx
+            if cls_idx == 1.0:
+                print('Green', b)
+                light_state = TrafficLight.GREEN
+            elif cls_idx == 2.0:
+                print('Red', b)
+                light_state = TrafficLight.RED
+            elif cls_idx == 3.0:
+                print('Yellow', b)
+                light_state = TrafficLight.YELLOW
+            elif cls_idx == 4.0:
+                print('Unknown', b)
+                light_state = TrafficLight.UNKNOWN
+            else:
+                print('Unknown! Did not process image well', b)
+                light_state = TrafficLight.UNKNOWN
+        rospy.logdebug('light_state:'+str(light_state))
 
-    
-    def filter_boxes(self, min_score, boxes, scores, classes, filter_classes):
-        """Return boxes with a confidence >= `min_score`"""
-        n = len(classes)
-        idxs = []
-        for i in range(n):
-            if classes[i] in filter_classes and scores[i] >= min_score:
-                idxs.append(i)
-        
-        filtered_boxes = boxes[idxs, ...]
-        filtered_scores = scores[idxs, ...]
-        filtered_classes = classes[idxs, ...]
-        return filtered_boxes, filtered_scores, filtered_classes
-
-
-    def to_image_coords(self, boxes, height, width):
-        """
-        The original box coordinate output is normalized, i.e [0, 1].
-        
-        This converts it back to the original coordinate based on the image
-        size.
-        """
-        box_coords = np.zeros_like(boxes)
-        box_coords[:, 0] = boxes[:, 0] * height
-        box_coords[:, 1] = boxes[:, 1] * width
-        box_coords[:, 2] = boxes[:, 2] * height
-        box_coords[:, 3] = boxes[:, 3] * width
-        
-        return box_coords
-
-    def draw_boxes(self, image, boxes, classes, thickness=4):
-        """Draw bounding boxes on the image"""
-        draw = ImageDraw.Draw(image)
-        for i in range(len(boxes)):
-            bot, left, top, right = boxes[i, ...]
-            class_id = int(classes[i])
-            color = self.COLOR_LIST[class_id]
-            draw.line([(left, top), (left, bot), (right, bot), (right, top), (left, top)], width=thickness, fill=color)
-
-    def findNoneZero(self, rgb_image):
-        rows,cols,_ = rgb_image.shape
-        counter = 0
-        for row in range(rows):
-            for col in range(cols):
-                pixels = rgb_image[row,col]
-                if sum(pixels)!=0:
-                    counter = counter+1
-        return counter
-
-    def red_green_yellow(self, rgb_image, display=False):
-        '''
-        Determines the red , green and yellow content in each image using HSV and experimentally
-        determined thresholds. Returns a Classification based on the values
-        '''
-
-        #image = cv2.imread(img_file)
-        #image = cv2.resize(image,(32,32))
-
-        #rgb_image = cv2.cvtColor(image,cv2.COLOR_BGR2RGB)
-
-        #rgb_image = Image.open(img_file)  
-        #rospy.loginfo("Detection Result:%f", rgb_image[1])
-        
-        #rgb_image.save('./test.jpg')
-        rgb_image = np.asarray(rgb_image)
-
-        hsv = cv2.cvtColor(rgb_image,cv2.COLOR_RGB2HSV)
-
-        sum_saturation = np.sum(hsv[:,:,1])# Sum the brightness values
-        area = 32*32
-        avg_saturation = sum_saturation / area #find average
-        
-        sat_low = int(avg_saturation*1) 
-        sat_low_red = int(avg_saturation*1) 
-        sat_low_yellow = int(avg_saturation) 
-        val_low = 140
-        
-        #print(sat_low, val_low)
-
-
-        #Green
-        lower_green = np.array([40,sat_low,val_low])
-        upper_green = np.array([100,255,255])
-        green_mask = cv2.inRange(hsv,lower_green,upper_green)
-        green_result = cv2.bitwise_and(rgb_image,rgb_image,mask = green_mask)
-        
-        #Yellow
-        lower_yellow = np.array([10,sat_low_yellow,val_low])
-        upper_yellow = np.array([60,255,255])
-        yellow_mask = cv2.inRange(hsv,lower_yellow,upper_yellow)
-        yellow_result = cv2.bitwise_and(rgb_image,rgb_image,mask=yellow_mask)
-        
-        # Red 
-        lower_red = np.array([150,sat_low_red,val_low])
-        upper_red = np.array([180,255,255])
-        red_mask1 = cv2.inRange(hsv,lower_red,upper_red)
-
-        lower_red2 = np.array([0,sat_low_red,val_low])
-        upper_red2 = np.array([30,255,255])
-        red_mask2 = cv2.inRange(hsv,lower_red2,upper_red2)
-
-        red_mask = np.bitwise_or(red_mask1, red_mask2)
-
-
-        red_result = cv2.bitwise_and(rgb_image,rgb_image,mask = red_mask)
-        '''
-        if display==True:
-            _,ax = plt.subplots(1,5,figsize=(20,10))
-            ax[0].set_title('rgb image')
-            ax[0].imshow(rgb_image)
-            ax[1].set_title('red result')
-            ax[1].imshow(red_result)
-            ax[2].set_title('yellow result')
-            ax[2].imshow(yellow_result)
-            ax[3].set_title('green result')
-            ax[3].imshow(green_result)
-            ax[4].set_title('hsv image')
-            ax[4].imshow(hsv)
-            plt.show()
-        '''
-        sum_green = self.findNoneZero(green_result)
-        sum_red = self.findNoneZero(red_result)
-        sum_yellow = self.findNoneZero(yellow_result)
-        #print(sum_red, sum_yellow, sum_green)
-        
-        if sum_red >= 1.5*sum_yellow and sum_red>=sum_green:
+        self.light_state = light_state
+        if light_state == TrafficLight.UNKNOWN:
             return 0
-        if sum_yellow>=sum_green:
+        else:
             return 1
-        return 2
+
+    def get_classification(self):
+        return self.light_state
+
+if __name__ == '__main__':
+    tl_cls=TLClassifier()
+    img_path = ''
+    cv_image = cv2.imread(img_path)
+    cv_image = cv2.resize(cv_image, (800, 600))
+    cv2.imshow('display', cv_image)
+    cv2.waitKey()
+    light_state = tl_cls.get_classification(cv_image)
